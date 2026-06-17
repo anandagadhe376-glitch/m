@@ -3326,8 +3326,106 @@ function enterApp() {
   setTimeout(() => { gate.style.display='none'; }, 500);
   showToast(`Welcome ${name}! 🎉 Enjoy the menu`);
   setGreetingName(name);
+
+  // ✅ FIX: Same phone se Firebase mein orders dhoondo
+  setTimeout(() => fetchOrdersByPhone(phone, name), 800);
 }
 window.enterApp = enterApp;
+
+// ── Firebase se phone number ke basis pe orders fetch karo ──
+async function fetchOrdersByPhone(phone, name) {
+  if(!window.__db) return;
+  try {
+    const { collection, query, where, getDocs, orderBy } =
+      await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
+    const db = window.__db;
+
+    // Phone se orders fetch karo (last 10, non-cancelled)
+    const q = query(
+      collection(db, 'orders'),
+      where('customerPhone', '==', phone)
+    );
+    const snap = await getDocs(q);
+    if(snap.empty) return; // Pehli baar hai — koi order nahi
+
+    // Saare orders collect karo
+    const allOrders = [];
+    snap.forEach(docSnap => {
+      const d = docSnap.data();
+      allOrders.push({ ...d, _fbId: docSnap.id });
+    });
+
+    // Timestamp ke hisaab se sort (newest first)
+    allOrders.sort((a, b) => {
+      const tA = a.createdAt?.seconds || a.timestamp?.seconds || 0;
+      const tB = b.createdAt?.seconds || b.timestamp?.seconds || 0;
+      return tB - tA;
+    });
+
+    // Active (non-cancelled, non-delivered) orders
+    const activeOrders = allOrders.filter(o =>
+      o.status !== 'cancelled' && o.status !== 'delivered' && o.status !== 'completed'
+    );
+    // Recent orders (last 5)
+    const recentOrders = allOrders.slice(0, 5);
+
+    // Global mein save karo
+    window._allMyOrders    = recentOrders;
+    window._activeMyOrders = activeOrders;
+
+    // Agar active order hai — restore karo
+    if(activeOrders.length > 0) {
+      const latest = activeOrders[0];
+      window._lastPlacedOrder  = latest;
+      window._lastOrderFbId    = latest._fbId;
+      window._orderTrackActive = false;
+
+      // Countdown calculate karo (order kitne der pehle aaya)
+      const createdSec = latest.createdAt?.seconds || latest.timestamp?.seconds || (Date.now()/1000 - 15*60);
+      const elapsedSec = Math.floor(Date.now()/1000 - createdSec);
+      const totalSec   = 15 * 60;
+      const remSec     = Math.max(0, totalSec - elapsedSec);
+      window._orderCountdownTotal = totalSec;
+      window._orderCountdownRem   = remSec;
+
+      // localStorage mein bhi save karo
+      try {
+        localStorage.setItem('siplora_active_order', JSON.stringify({
+          ...latest,
+          _savedAt: Date.now(),
+          _countdownTotal: totalSec,
+          _countdownRem: remSec,
+          _fbOrderId: latest._fbId
+        }));
+      } catch(e) {}
+
+      // Firebase real-time tracking shuru karo
+      if(latest._fbId) {
+        setTimeout(() => startOrderTracking(latest._fbId), 1000);
+      }
+
+      // Toast dikhao
+      showToast(`&#x1F4E6; ${activeOrders.length} active order${activeOrders.length>1?'s':''} mila! Orders tab mein dekho.`);
+
+      // Orders nav dot dikhao
+      const navIcon = document.querySelector('.nav-item[onclick*="orders"] .nav-icon');
+      if(navIcon && !document.getElementById('ordersNavDot')) {
+        navIcon.style.position = 'relative';
+        const dot = document.createElement('span');
+        dot.id = 'ordersNavDot';
+        dot.style.cssText = 'position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:#22c55e;border:2px solid var(--bg);animation:pulse-notif 2s infinite;';
+        navIcon.appendChild(dot);
+      }
+    } else if(recentOrders.length > 0) {
+      // Sirf history hai, active order nahi
+      showToast(`&#x1F4CB; Aapke ${recentOrders.length} past orders Orders tab mein hain!`);
+    }
+
+  } catch(e) {
+    console.warn('[Siplora] fetchOrdersByPhone error:', e);
+  }
+}
+window.fetchOrdersByPhone = fetchOrdersByPhone;
 
 /* ══ FIREBASE ADS — REAL TIME ══ */
 window.addEventListener('ads-live-updated', () => {
@@ -5158,31 +5256,38 @@ function renderOrdersPanel() {
   const container = document.getElementById('ordersPanelContent');
   if(!container) return;
 
-  if(!window._lastPlacedOrder || !window._lastPlacedOrder.items || !window._lastPlacedOrder.items.length) {
+  const activeOrder = window._lastPlacedOrder;
+  const allOrders   = window._allMyOrders || [];
+  const hasActive   = activeOrder && activeOrder.items && activeOrder.items.length > 0;
+
+  if(!hasActive && allOrders.length === 0) {
     container.innerHTML = `
       <div style="text-align:center;padding:48px 20px;">
-        <div style="font-size:52px;margin-bottom:14px;">🍽️</div>
-        <div style="font-size:17px;font-weight:700;color:var(--text);">No Active Order</div>
+        <div style="font-size:52px;margin-bottom:14px;">&#x1F37D;&#xFE0F;</div>
+        <div style="font-size:17px;font-weight:700;color:var(--text);">No Orders Yet</div>
         <div style="font-size:13px;color:var(--text3);margin-top:6px;line-height:1.6;">Abhi tak koi order place nahi kiya.<br>Menu se kuch order karo!</div>
       </div>`;
     return;
   }
 
-  const order = window._lastPlacedOrder;
-  const sub  = order.subtotal || 0;
-  const disc = order.discountAmount || 0;
-  const tax  = order.taxes || 0;
-  const tot  = order.totalAmount || (sub - disc + tax);
+  let html = '';
 
-  container.innerHTML = `
-    <!-- Live Timer -->
+  // ══ ACTIVE ORDER ══
+  if(hasActive) {
+    const order = activeOrder;
+    const sub  = order.subtotal || 0;
+    const disc = order.discountAmount || 0;
+    const tax  = order.taxes || 0;
+    const tot  = order.totalAmount || (sub - disc + tax);
+
+    html += `
+    <div style="font-size:11px;font-weight:800;color:#F97316;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;padding:0 2px;">&#x1F7E0; Active Order</div>
     <div style="background:linear-gradient(135deg,rgba(249,115,22,0.14),rgba(234,179,8,0.08));border:1.5px solid rgba(249,115,22,0.4);border-radius:22px;padding:20px 18px;">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
         <div style="font-size:12px;font-weight:700;color:#F97316;text-transform:uppercase;letter-spacing:0.8px;display:flex;align-items:center;gap:6px;">
-          <span style="width:8px;height:8px;border-radius:50%;background:#F97316;display:inline-block;animation:fb-blink 1.2s infinite;"></span>
-          Live Order Status
+          <span style="width:8px;height:8px;border-radius:50%;background:#F97316;display:inline-block;animation:fb-blink 1.2s infinite;"></span>Live Order Status
         </div>
-        <div id="opStatus" style="font-size:11px;font-weight:700;color:#F97316;background:rgba(249,115,22,0.12);border:1px solid rgba(249,115,22,0.3);padding:3px 10px;border-radius:99px;">🍳 Preparing</div>
+        <div id="opStatus" style="font-size:11px;font-weight:700;color:#F97316;background:rgba(249,115,22,0.12);border:1px solid rgba(249,115,22,0.3);padding:3px 10px;border-radius:99px;">&#x1F373; Preparing</div>
       </div>
       <div style="text-align:center;padding:4px 0 10px;">
         <div style="font-size:11px;color:rgba(241,240,255,0.45);margin-bottom:6px;">Remaining Time</div>
@@ -5194,78 +5299,69 @@ function renderOrdersPanel() {
         <div style="margin:12px 4px 0;height:6px;background:rgba(255,255,255,0.08);border-radius:99px;overflow:hidden;">
           <div id="opBar" style="height:100%;width:100%;background:linear-gradient(90deg,#F97316,#FBB024);border-radius:99px;transition:width 1s linear;box-shadow:0 0 8px rgba(249,115,22,0.5);"></div>
         </div>
-        <div id="opMsg" style="font-size:12px;color:rgba(249,115,22,0.8);margin-top:10px;font-weight:500;">👨‍🍳 Chef has received your order...</div>
+        <div id="opMsg" style="font-size:12px;color:rgba(249,115,22,0.8);margin-top:10px;font-weight:500;">&#x1F468;&#x200D;&#x1F373; Chef has received your order...</div>
       </div>
     </div>
-
-    <!-- Order ID -->
     <div style="background:var(--glass);border:1px solid rgba(168,85,247,0.25);border-radius:16px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;">
       <div>
         <div style="font-size:10px;font-weight:700;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">Order ID</div>
-        <div style="font-size:18px;font-weight:900;color:#A855F7;letter-spacing:2px;">${order.orderId||'—'}</div>
+        <div style="font-size:18px;font-weight:900;color:#A855F7;letter-spacing:2px;">${order.orderId||'&#x2014;'}</div>
       </div>
-      ${order.tableNumber && order.tableNumber!=='walk-in' ? `<div style="background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:8px 14px;text-align:center;"><div style="font-size:10px;color:var(--text3);font-weight:600;">TABLE</div><div style="font-size:20px;font-weight:900;color:#EAB308;">${order.tableNumber}</div></div>` : '<div style="font-size:11px;font-weight:600;color:var(--text3);">🚶 Walk-in</div>'}
+      ${order.tableNumber && order.tableNumber!=='walk-in' ? '<div style="background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:8px 14px;text-align:center;"><div style="font-size:10px;color:var(--text3);font-weight:600;">TABLE</div><div style="font-size:20px;font-weight:900;color:#EAB308;">'+order.tableNumber+'</div></div>' : '<div style="font-size:11px;font-weight:600;color:var(--text3);">&#x1F6B6; Walk-in</div>'}
     </div>
-
-    <!-- Items List -->
     <div style="background:rgba(168,85,247,0.06);border:1.5px solid rgba(168,85,247,0.2);border-radius:20px;padding:16px 18px;">
-      <div style="font-size:13px;font-weight:800;color:var(--text);margin-bottom:14px;display:flex;align-items:center;gap:8px;">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>
-        Your Items (${order.items.length})
-      </div>
-      ${order.items.map(it=>`
-        <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
-          <div style="width:44px;height:44px;border-radius:12px;overflow:hidden;flex-shrink:0;background:var(--glass);">
-            ${it.image ? `<img src="${it.image}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none'" />` : `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:20px;">🍽️</div>`}
-          </div>
-          <div style="flex:1;min-width:0;">
-            <div style="font-size:14px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${it.name}</div>
-            <div style="font-size:11px;color:var(--text3);margin-top:2px;">×${it.qty||1}${it.spiceLevel ? ' · '+it.spiceLevel+' spice' : ''}</div>
-          </div>
-          <div style="font-size:14px;font-weight:800;color:var(--gold);flex-shrink:0;">₹${(it.priceNum||parseInt((it.price||'0').replace(/[^\d]/g,'')))*(it.qty||1)}</div>
-        </div>`).join('')}
+      <div style="font-size:13px;font-weight:800;color:var(--text);margin-bottom:14px;">&#x1F6D2; Your Items (${order.items.length})</div>
+      ${order.items.map(it=>'<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);"><div style="width:44px;height:44px;border-radius:12px;overflow:hidden;flex-shrink:0;background:var(--glass);">'+(it.image?'<img src="'+it.image+'" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display=\'none\'" />':'<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:20px;">&#x1F37D;&#xFE0F;</div>')+'</div><div style="flex:1;min-width:0;"><div style="font-size:14px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'+it.name+'</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">x'+(it.qty||1)+(it.spiceLevel?' - '+it.spiceLevel+' spice':'')+'</div></div><div style="font-size:14px;font-weight:800;color:var(--gold);flex-shrink:0;">&#x20B9;'+((it.priceNum||parseInt((it.price||'0').replace(/[^\d]/g,'')))*(it.qty||1))+'</div></div>').join('')}
     </div>
-
-    <!-- Bill Summary -->
     <div style="background:rgba(234,179,8,0.06);border:1.5px solid rgba(234,179,8,0.22);border-radius:20px;padding:16px 18px;">
       <div style="font-size:13px;font-weight:800;color:var(--text);margin-bottom:12px;">&#x1F4CB; Bill Summary</div>
       <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:var(--text2);"><span>Items Total</span><span>&#x20B9;${sub}</span></div>
-      ${disc>0 ? `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#22c55e;"><span>&#x1F39F;&#xFE0F; Coupon (${order.couponCode})</span><span>-&#x20B9;${disc}</span></div>` : ''}
+      ${disc>0?'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#22c55e;"><span>&#x1F39F;&#xFE0F; Coupon ('+order.couponCode+')</span><span>-&#x20B9;'+disc+'</span></div>':''}
       <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:var(--text2);"><span>GST &amp; Taxes (5%)</span><span>&#x20B9;${tax}</span></div>
       <div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:16px;font-weight:900;color:#EAB308;"><span>Total Amount</span><span>&#x20B9;${tot}</span></div>
     </div>
-
-    <!-- Cancel Order Button -->
     <div style="margin-top:4px;">
-      <button onclick="confirmCancelOrder()" id="cancelOrderBtn" style="width:100%;padding:16px;border-radius:18px;background:linear-gradient(135deg,rgba(239,68,68,0.12),rgba(239,68,68,0.08));border:1.5px solid rgba(239,68,68,0.4);color:#ef4444;font-family:var(--font-circular);font-size:15px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all 0.25s;letter-spacing:0.2px;">
+      <button onclick="confirmCancelOrder()" id="cancelOrderBtn" style="width:100%;padding:16px;border-radius:18px;background:linear-gradient(135deg,rgba(239,68,68,0.12),rgba(239,68,68,0.08));border:1.5px solid rgba(239,68,68,0.4);color:#ef4444;font-family:var(--font-circular);font-size:15px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;">
         &#x2715; Cancel Order
       </button>
-      <div style="text-align:center;font-size:11px;color:var(--text3);margin-top:8px;line-height:1.5;">
-        &#x26A0;&#xFE0F; Order cancel hone ke baad chef ko turant notify kiya jayega
-      </div>
+      <div style="text-align:center;font-size:11px;color:var(--text3);margin-top:8px;">&#x26A0;&#xFE0F; Order cancel hone ke baad chef ko turant notify kiya jayega</div>
     </div>
-
-    <!-- Cancel Confirm Modal -->
     <div id="cancelConfirmModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);align-items:center;justify-content:center;">
       <div style="background:var(--bg2);border:1px solid rgba(239,68,68,0.35);border-radius:28px;padding:28px 24px;margin:20px;max-width:360px;width:100%;box-shadow:0 32px 80px rgba(0,0,0,0.6);">
         <div style="text-align:center;margin-bottom:20px;">
           <div style="font-size:48px;margin-bottom:10px;">&#x1F61F;</div>
           <div style="font-family:var(--font-circular);font-size:19px;font-weight:900;color:var(--text);margin-bottom:8px;">Cancel karna chahte ho?</div>
-          <div style="font-size:13px;color:var(--text2);line-height:1.6;">Aapka order <strong style="color:#ef4444;">${order.orderId||''}</strong> cancel ho jayega aur chef ko immediately notify kiya jayega.</div>
+          <div style="font-size:13px;color:var(--text2);line-height:1.6;">Order <strong style="color:#ef4444;">${order.orderId||''}</strong> cancel ho jayega.</div>
         </div>
         <div style="display:flex;flex-direction:column;gap:10px;">
-          <button onclick="cancelOrder()" style="width:100%;padding:15px;border-radius:14px;background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;font-family:var(--font-circular);font-size:15px;font-weight:800;border:none;cursor:pointer;box-shadow:0 6px 20px rgba(239,68,68,0.4);">
-            Haan, Cancel Karo
-          </button>
-          <button onclick="document.getElementById('cancelConfirmModal').style.display='none'" style="width:100%;padding:14px;border-radius:14px;background:var(--glass2);border:1px solid var(--border);color:var(--text);font-family:var(--font-circular);font-size:14px;font-weight:700;cursor:pointer;">
-            Nahi, Wapas Jao
-          </button>
+          <button onclick="cancelOrder()" style="width:100%;padding:15px;border-radius:14px;background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;font-family:var(--font-circular);font-size:15px;font-weight:800;border:none;cursor:pointer;">Haan, Cancel Karo</button>
+          <button onclick="document.getElementById('cancelConfirmModal').style.display='none'" style="width:100%;padding:14px;border-radius:14px;background:var(--glass2);border:1px solid var(--border);color:var(--text);font-family:var(--font-circular);font-size:14px;font-weight:700;cursor:pointer;">Nahi, Wapas Jao</button>
         </div>
       </div>
     </div>`;
+  }
 
-  // Start the live timer
-  startOrdersPanelTimer();
+  // ══ ORDER HISTORY ══
+  const historyOrders = allOrders.filter(o => !hasActive || o.orderId !== (activeOrder && activeOrder.orderId));
+  if(historyOrders.length > 0) {
+    html += '<div style="font-size:11px;font-weight:800;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px;margin-top:'+(hasActive?'16px':'0')+';margin-bottom:4px;padding:0 2px;">&#x1F4DC; Order History</div>';
+    historyOrders.forEach(o => {
+      const oSt = o.status || 'preparing';
+      const isCan = oSt==='cancelled';
+      const isDel = oSt==='delivered'||oSt==='completed';
+      const sIcon = isCan?'&#x274C;':isDel?'&#x2705;':'&#x1F373;';
+      const sClr  = isCan?'#ef4444':isDel?'#22c55e':'#F97316';
+      const sText = isCan?'Cancelled':isDel?'Delivered':'Preparing';
+      const tot   = o.totalAmount||o.subtotal||0;
+      const names = (o.items||[]).map(i=>i.name).join(', ');
+      const sec   = o.createdAt?.seconds||o.timestamp?.seconds||0;
+      const tStr  = sec ? new Date(sec*1000).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '';
+      html += '<div style="background:var(--glass);border:1px solid var(--border);border-radius:18px;padding:16px 18px;"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;"><div><div style="font-size:10px;color:var(--text3);font-weight:600;letter-spacing:1px;text-transform:uppercase;">Order ID</div><div style="font-size:15px;font-weight:900;color:#A855F7;">'+(o.orderId||'&#x2014;')+'</div></div><div style="font-size:11px;font-weight:700;color:'+sClr+';background:rgba(0,0,0,0.18);border:1px solid '+sClr+'44;padding:4px 10px;border-radius:99px;">'+sIcon+' '+sText+'</div></div><div style="font-size:12px;color:var(--text2);line-height:1.6;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'+(names||'Items not available')+'</div><div style="display:flex;align-items:center;justify-content:space-between;"><div style="font-size:11px;color:var(--text3);">'+tStr+'</div><div style="font-size:15px;font-weight:900;color:#EAB308;">&#x20B9;'+tot+'</div></div>'+(o.tableNumber&&o.tableNumber!=='walk-in'?'<div style="margin-top:6px;font-size:11px;color:var(--text3);">&#x1FA91; Table '+o.tableNumber+'</div>':'')+'</div>';
+    });
+  }
+
+  container.innerHTML = html;
+  if(hasActive) startOrdersPanelTimer();
 }
 window.renderOrdersPanel = renderOrdersPanel;
 
@@ -5280,54 +5376,34 @@ window.confirmCancelOrder = confirmCancelOrder;
 async function cancelOrder() {
   const modal = document.getElementById('cancelConfirmModal');
   if(modal) modal.style.display = 'none';
-
   const order = window._lastPlacedOrder;
   if(!order) return;
-
   const btn = document.getElementById('cancelOrderBtn');
   if(btn) { btn.disabled=true; btn.innerHTML='&#x23F3; Cancelling...'; btn.style.opacity='0.6'; }
-
   let cancelledOnServer = false;
-
   try {
     if(window.__db && window._lastOrderFbId) {
       const { doc, updateDoc, serverTimestamp } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
-      const orderRef = doc(window.__db, 'orders', window._lastOrderFbId);
-      await updateDoc(orderRef, {
-        status: 'cancelled',
-        cancelledAt: serverTimestamp(),
-        cancelledBy: 'customer',
-        cancelReason: 'Customer emergency - cancelled from menu app'
+      await updateDoc(doc(window.__db,'orders',window._lastOrderFbId), {
+        status:'cancelled', cancelledAt:serverTimestamp(), cancelledBy:'customer',
+        cancelReason:'Customer emergency - cancelled from menu app'
       });
       cancelledOnServer = true;
-
-      // Table ko bhi free karo
       if(order.tableNumber && !isNaN(parseInt(order.tableNumber))) {
         try {
-          const { doc: docFn, setDoc } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
-          const tableRef = docFn(window.__db, 'tables', String(parseInt(order.tableNumber)));
-          await setDoc(tableRef, { status: 'available', currentOrder: null, lastOrderId: null }, { merge: true });
-        } catch(te) { console.warn('Table free error:', te); }
+          const { doc:d2, setDoc } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
+          await setDoc(d2(window.__db,'tables',String(parseInt(order.tableNumber))),
+            { status:'available', currentOrder:null, lastOrderId:null }, { merge:true });
+        } catch(te) { console.warn('Table free error:',te); }
       }
     }
-  } catch(e) {
-    console.error('Cancel order Firebase error:', e);
-  }
-
-  // Local state clear
-  if(window._ordersPanelTimer) { clearInterval(window._ordersPanelTimer); window._ordersPanelTimer=null; }
-  if(window._orderTrackUnsub)  { window._orderTrackUnsub(); window._orderTrackUnsub=null; }
-  window._lastPlacedOrder    = null;
-  window._lastOrderFbId      = null;
-  window._orderTrackActive   = false;
-  window._orderCountdownTotal = 0;
-  window._orderCountdownRem   = 0;
+  } catch(e) { console.error('Cancel order Firebase error:',e); }
+  if(window._ordersPanelTimer){ clearInterval(window._ordersPanelTimer); window._ordersPanelTimer=null; }
+  if(window._orderTrackUnsub) { window._orderTrackUnsub(); window._orderTrackUnsub=null; }
+  window._lastPlacedOrder=null; window._lastOrderFbId=null; window._orderTrackActive=false;
+  window._orderCountdownTotal=0; window._orderCountdownRem=0;
   try { localStorage.removeItem('siplora_active_order'); } catch(e) {}
-
-  showToast(cancelledOnServer
-    ? '&#x274C; Order cancel ho gaya! Chef ko notify kar diya gaya.'
-    : '&#x274C; Order cancel ho gaya (offline mode).');
-
+  showToast(cancelledOnServer ? '&#x274C; Order cancel ho gaya! Chef ko notify kar diya.' : '&#x274C; Order cancel ho gaya (offline).');
   const container = document.getElementById('ordersPanelContent');
   if(container) {
     container.innerHTML = `
@@ -5335,10 +5411,9 @@ async function cancelOrder() {
         <div style="font-size:60px;margin-bottom:14px;">&#x274C;</div>
         <div style="font-family:var(--font-circular);font-size:19px;font-weight:900;color:#ef4444;margin-bottom:8px;">Order Cancelled</div>
         <div style="font-size:13px;color:var(--text3);line-height:1.7;margin-bottom:24px;">
-          Aapka order <strong style="color:var(--text);">${order.orderId||''}</strong> cancel ho gaya hai.<br>
-          Chef ko turant inform kar diya gaya hai. &#x1F64F;
+          Order <strong style="color:var(--text);">${order.orderId||''}</strong> cancel ho gaya.<br>Chef ko inform kar diya gaya. &#x1F64F;
         </div>
-        <button onclick="setNav(document.querySelector('.nav-item'),'home')" style="padding:14px 32px;border-radius:16px;background:linear-gradient(135deg,#A855F7,#7c3aed);color:#fff;font-family:var(--font-circular);font-size:14px;font-weight:800;border:none;cursor:pointer;box-shadow:0 6px 20px rgba(168,85,247,0.4);">
+        <button onclick="setNav(document.querySelector('.nav-item'),'home')" style="padding:14px 32px;border-radius:16px;background:linear-gradient(135deg,#A855F7,#7c3aed);color:#fff;font-family:var(--font-circular);font-size:14px;font-weight:800;border:none;cursor:pointer;">
           &#x1F37D;&#xFE0F; Menu pe Wapas Jao
         </button>
       </div>`;
